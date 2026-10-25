@@ -228,3 +228,36 @@ async fn test_poll_stream() -> std::result::Result<(), io::Error> {
 
     Ok(())
 }
+
+#[tokio::test]
+async fn remote_reset_drains_received_messages_before_eof() -> Result<()> {
+    let stream = create_test_stream();
+    for (tsn, message) in [(1, b"reply one".as_slice()), (2, b"reply two".as_slice())] {
+        stream
+            .handle_data(ChunkPayloadData {
+                tsn,
+                unordered: true,
+                beginning_fragment: true,
+                ending_fragment: true,
+                user_data: Bytes::copy_from_slice(message),
+                payload_type: PayloadProtocolIdentifier::Binary,
+                ..Default::default()
+            })
+            .await;
+    }
+    // AssociationInternal::unregister_stream sets these flags on remote reset.
+    stream.read_shutdown.store(true, Ordering::SeqCst);
+    stream.write_shutdown.store(true, Ordering::SeqCst);
+
+    let mut buffer = [0; 32];
+    for expected in [b"reply one", b"reply two"] {
+        let (length, protocol) = stream.read_sctp(&mut buffer).await?;
+        assert_eq!(&buffer[..length], expected);
+        assert_eq!(protocol, PayloadProtocolIdentifier::Binary);
+    }
+    assert_eq!(
+        stream.read_sctp(&mut buffer).await?,
+        (0, PayloadProtocolIdentifier::Unknown)
+    );
+    Ok(())
+}

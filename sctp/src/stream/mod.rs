@@ -181,9 +181,11 @@ impl Stream {
     /// Returns `(0, PayloadProtocolIdentifier::Unknown)` if the reading half of this stream is shutdown or it (the stream) was reset.
     pub async fn read_sctp(&self, p: &mut [u8]) -> Result<(usize, PayloadProtocolIdentifier)> {
         loop {
-            if self.read_shutdown.load(Ordering::SeqCst) {
-                return Ok((0, PayloadProtocolIdentifier::Unknown));
-            }
+            // Register before checking the queue/EOF so a concurrent reset's
+            // notify_waiters cannot be lost between the check and the await.
+            let notified = self.read_notifier.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
 
             let result = {
                 let mut reassembly_queue = self.reassembly_queue.lock().await;
@@ -193,8 +195,12 @@ impl Stream {
             match result {
                 Ok(_) | Err(Error::ErrShortBuffer { .. }) => return result,
                 Err(_) => {
-                    // wait for the next chunk to become available
-                    self.read_notifier.notified().await;
+                    // A reset ends future delivery, but messages received before
+                    // it must reach the application before EOF is reported.
+                    if self.read_shutdown.load(Ordering::SeqCst) {
+                        return Ok((0, PayloadProtocolIdentifier::Unknown));
+                    }
+                    notified.await;
                 }
             }
         }
