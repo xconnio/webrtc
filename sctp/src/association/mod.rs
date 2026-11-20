@@ -473,7 +473,7 @@ impl Association {
         let done = Arc::new(AtomicBool::new(false));
         let name = Arc::new(name);
 
-        'outer: while !done.load(Ordering::Relaxed) {
+        while !done.load(Ordering::Relaxed) {
             //log::debug!("[{}] gather_outbound begin", name);
             let (packets, continue_loop) = {
                 let mut ai = association_internal.lock().await;
@@ -491,40 +491,22 @@ impl Association {
                     .take()
                     .unwrap_or_else(|| BytesMut::with_capacity(16 * 1024));
 
-                // We do the marshalling work in a blocking task here for a reason:
-                // If we don't tokio tends to run the write_loop and read_loop of one connection on the same OS thread
-                // This means that even though we release the lock above, the read_loop isn't able to take it, simply because it is not being scheduled by tokio
-                // Doing it this way, tokio schedules this work on a dedicated blocking thread, this future is suspended, and the read_loop can make progress
-                match tokio::task::spawn_blocking(move || raw.marshal_to(&mut buf).map(|_| buf))
-                    .await
-                {
-                    Ok(Ok(mut buf)) => {
-                        let raw = buf.as_ref();
-                        if let Err(err) = net_conn.send(raw.as_ref()).await {
+                match raw.marshal_to(&mut buf) {
+                    Ok(_) => {
+                        if let Err(err) = net_conn.send(buf.as_ref()).await {
                             log::warn!("[{name2}] failed to write packets on net_conn: {err}");
-                            done2.store(true, Ordering::Relaxed)
+                            done2.store(true, Ordering::Relaxed);
                         } else {
-                            bytes_sent.fetch_add(raw.len(), Ordering::SeqCst);
+                            bytes_sent.fetch_add(buf.len(), Ordering::SeqCst);
                         }
-
-                        // Reuse allocation. Have to use options, since spawn blocking can't borrow, has to take ownership.
-                        buf.clear();
-                        buffer = Some(buf);
-                    }
-                    Ok(Err(err)) => {
-                        log::warn!("[{name2}] failed to serialize a packet: {err:?}");
                     }
                     Err(err) => {
-                        if err.is_cancelled() {
-                            log::debug!(
-                                "[{name}] task cancelled while serializing a packet: {err:?}"
-                            );
-                            break 'outer;
-                        } else {
-                            log::error!("[{name}] panic while serializing a packet: {err:?}");
-                        }
+                        log::warn!("[{name2}] failed to serialize a packet: {err:?}");
                     }
                 }
+                buf.clear();
+                buffer = Some(buf);
+                tokio::task::yield_now().await;
                 //log::debug!("[{}] sending {} bytes done", name, raw.len());
             }
 
